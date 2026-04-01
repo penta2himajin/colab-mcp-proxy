@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "colab-mcp-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  /**
+   * Secrets (set via `wrangler secret put`):
+   *   GITHUB_CLIENT_ID
+   *   GITHUB_CLIENT_SECRET
+   *   COOKIE_ENCRYPTION_KEY
+   *   ALLOWED_USERS          — comma-separated GitHub usernames (optional)
+   */
+  "migrations": [
+    {
+      "new_sqlite_classes": ["ColabMCP"],
+      "tag": "v1"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "ColabMCP",
+        "name": "MCP_OBJECT"
+      }
+    ]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "42285262869245a39796a754aba6e299"
+    },
+    {
+      "binding": "COLAB_KV",
+      "id": "f941bc0be7da46f5b54bea1ec2b5f453"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  },
+  "dev": {
+    "port": 8788
+  }
+}
