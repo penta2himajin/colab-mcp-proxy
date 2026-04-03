@@ -133,11 +133,44 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"colab_status",
-			"Get the status of the connected Google Colab runtime (GPU info, memory, etc.)",
+			"Get the status of the Colab system. Shows tunnel URL readiness, keepalive state, and runtime info (GPU, memory). Call this after colab_start to check when the runtime is ready.",
 			{},
 			async () => {
+				const tunnelUrl = await this.env.COLAB_KV.get("colab_tunnel_url");
+				const keepaliveStatus = await (async () => {
+					try {
+						const res = await keepaliveApiCall(this.env, "/status", "GET");
+						if (res.ok) return await res.json();
+					} catch { /* container may be stopped */ }
+					return null;
+				})();
+
+				if (!tunnelUrl) {
+					return {
+						content: [{
+							type: "text",
+							text: JSON.stringify({
+								tunnel_connected: false,
+								message: "No tunnel URL registered yet. If colab_start was called, the runtime is still starting up.",
+								keepalive: keepaliveStatus,
+							}, null, 2),
+						}],
+					};
+				}
+
+				// Tunnel URL exists — try to get runtime status
 				const result = await this.callColab("/status", "GET");
-				return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+				return {
+					content: [{
+						type: "text",
+						text: JSON.stringify({
+							tunnel_connected: true,
+							tunnel_url: tunnelUrl,
+							keepalive: keepaliveStatus,
+							runtime: result,
+						}, null, 2),
+					}],
+				};
 			},
 		);
 
@@ -243,10 +276,13 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 					}
 
 					// 3. Get the worker's own URL for callback
-					const workerUrl = `https://colab-mcp-proxy.workers.dev`;
+					const workerUrl = `https://colab-mcp-proxy.penta2himajin.workers.dev`;
 					const callbackUrl = `${workerUrl}/internal/register-tunnel`;
 
-					// 4. Tell keepalive container to start the session
+					// 4. Clear any stale tunnel URL
+					await this.env.COLAB_KV.delete("colab_tunnel_url");
+
+					// 5. Tell keepalive container to start the session (async — returns 202)
 					const startRes = await keepaliveApiCall(this.env, "/start", "POST", {
 						notebook_url,
 						callback_url: callbackUrl,
@@ -262,25 +298,11 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 						};
 					}
 
-					// 5. Poll KV for tunnel URL (max 300 seconds, 5 second interval)
-					const pollDeadline = Date.now() + 300_000;
-					while (Date.now() < pollDeadline) {
-						const tunnelUrl = await this.env.COLAB_KV.get("colab_tunnel_url");
-						if (tunnelUrl) {
-							return {
-								content: [{
-									type: "text",
-									text: `Colab runtime started successfully!\nTunnel URL: ${tunnelUrl}\nKeepalive is active — the runtime will stay connected.`,
-								}],
-							};
-						}
-						await new Promise((r) => setTimeout(r, 2000));
-					}
-
+					// 6. Return immediately — use colab_status to check when ready
 					return {
 						content: [{
 							type: "text",
-							text: "Timed out waiting for tunnel URL (300s). The keepalive container may still be working. Use keepalive_screenshot to check the current state.",
+							text: "Colab session starting. The keepalive container is now opening the notebook, connecting the runtime, and running all cells.\n\nUse colab_status to check when the tunnel URL is ready (typically 1-3 minutes).\nUse keepalive_screenshot to see the current browser state if needed.",
 						}],
 					};
 				} catch (e: unknown) {
