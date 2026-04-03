@@ -146,7 +146,7 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 	}
 }
 
-export default new OAuthProvider({
+const oauthProvider = new OAuthProvider({
 	apiHandler: ColabMCP.serve("/mcp"),
 	apiRoute: "/mcp",
 	authorizeEndpoint: "/authorize",
@@ -154,3 +154,26 @@ export default new OAuthProvider({
 	defaultHandler: GitHubHandler as any,
 	tokenEndpoint: "/token",
 });
+
+export default {
+	fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		return oauthProvider.fetch(request, env, ctx);
+	},
+
+	async scheduled(
+		_controller: ScheduledController,
+		env: Env,
+		_ctx: ExecutionContext,
+	) {
+		const tunnelUrl = await env.COLAB_KV.get("colab_tunnel_url");
+		if (!tunnelUrl) return;
+
+		try {
+			await fetch(`${tunnelUrl}/status`, {
+				signal: AbortSignal.timeout(10_000),
+			});
+		} catch {
+			// Colab runtime may be disconnected — silently ignore
+		}
+	},
+};

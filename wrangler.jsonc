@@ -38,6 +38,9 @@
   "observability": {
     "enabled": true
   },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "dev": {
     "port": 8788
   }
