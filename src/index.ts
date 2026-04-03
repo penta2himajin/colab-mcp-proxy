@@ -96,7 +96,7 @@ async function waitForHealth(env: Env, timeoutMs: number): Promise<boolean> {
 		} catch {
 			// Not ready yet
 		}
-		await new Promise((r) => setTimeout(r, 3000));
+		await new Promise((r) => setTimeout(r, 1000));
 	}
 	return false;
 }
@@ -274,7 +274,7 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 								}],
 							};
 						}
-						await new Promise((r) => setTimeout(r, 5000));
+						await new Promise((r) => setTimeout(r, 2000));
 					}
 
 					return {

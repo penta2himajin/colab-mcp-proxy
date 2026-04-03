@@ -129,7 +129,7 @@ async function waitForRuntimeConnection(timeoutMs) {
       // DOM not ready yet
     }
 
-    await sleep(3000);
+    await sleep(2000);
   }
 
   return false;
@@ -168,7 +168,7 @@ async function waitForTunnelUrl(timeoutMs) {
       // Page might be navigating
     }
 
-    await sleep(5000);
+    await sleep(2000);
   }
 
   return null;
