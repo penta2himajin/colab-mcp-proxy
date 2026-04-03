@@ -75,7 +75,8 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === "/setup" && method === "POST") {
-      await launchBrowser("https://accounts.google.com", { setup: true });
+      // Launch browser without navigating — user will navigate via DevTools
+      await launchBrowser(null, { setup: true });
       return json(res, 200, {
         ok: true,
         message: "Chrome launched with remote debugging on port 9222. Use 'fly proxy 9222:9222' and connect via chrome://inspect to log in to Google.",

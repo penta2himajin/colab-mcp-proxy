@@ -37,13 +37,17 @@ export async function launchBrowser(url, opts = {}) {
     executablePath: CHROME_PATH,
     headless: true,
     args,
+    protocolTimeout: 120_000,
   });
 
   page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
-  if (url) {
+  if (url && !opts.setup) {
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60_000 });
+  } else if (url) {
+    // In setup mode, navigate without waiting for networkidle
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
   return page;
