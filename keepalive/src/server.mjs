@@ -74,11 +74,6 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true, message: "Stopped" });
     }
 
-    if (path === "/setup" && method === "POST") {
-      await launchBrowser(null);
-      return json(res, 200, { ok: true, message: "Chrome launched in headless mode." });
-    }
-
     // Upload Chrome profile (tar.gz)
     if (path === "/upload-profile" && method === "POST") {
       const chunks = [];
