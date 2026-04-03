@@ -9,6 +9,9 @@ declare namespace Cloudflare {
 		COOKIE_ENCRYPTION_KEY: string;
 		ALLOWED_USERS: string;
 		MCP_OBJECT: DurableObjectNamespace<import("./src/index").ColabMCP>;
+		FLYIO_API_TOKEN: string;
+		FLYIO_APP_NAME: string;
+		KEEPALIVE_API_KEY: string;
 	}
 }
 interface Env extends Cloudflare.Env {}

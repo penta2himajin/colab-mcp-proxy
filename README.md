@@ -10,6 +10,28 @@ Cloudflare Workers (MCP Server + OAuth Provider)
 Google Colab (Flask executor + cloudflared tunnel)
 ```
 
+With the optional **keepalive** integration, a fly.io container running headless Chrome keeps the Colab runtime alive by simulating UI interactions, and automatically starts the notebook and extracts the tunnel URL:
+
+```
+Claude → colab_start(notebook_url)
+           ↓
+    CF Worker
+      1. fly.io Machines API → keepalive container start
+      2. Pass notebook_url + callback_url
+           ↓
+    fly.io container (Headless Chrome + Puppeteer)
+      1. Open Colab notebook (with persisted Google login cookies)
+      2. Wait for runtime connection
+      3. Run all cells (Flask + cloudflared)
+      4. Extract trycloudflare.com tunnel URL from output
+      5. POST tunnel URL to CF Worker callback → stored in COLAB_KV
+      6. Keepalive mode (60s interval: UI click/key simulation)
+      7. On disconnect → notify CF Worker → cleanup
+           ↓
+    CF Worker → return tunnel URL to Claude
+    colab_exec, colab_python, etc. now work
+```
+
 ## Setup
 
 ### 1. Create GitHub OAuth App
@@ -19,7 +41,7 @@ Go to https://github.com/settings/developers → New OAuth App:
 - **Homepage URL**: `https://<your-worker>.workers.dev`
 - **Callback URL**: `https://<your-worker>.workers.dev/callback`
 
-### 2. Deploy
+### 2. Deploy CF Worker
 
 ```bash
 npm install
@@ -40,7 +62,7 @@ npx wrangler secret put ALLOWED_USERS            # comma-separated GitHub userna
 npm run deploy
 ```
 
-### 3. Start Colab Executor
+### 3. Start Colab Executor (Manual Mode)
 
 Paste the following cells into a Google Colab notebook:
 
@@ -152,16 +174,102 @@ else:
 3. Authenticate with GitHub
 4. Use `colab_register` tool to register the tunnel URL
 
+---
+
+## Keepalive Setup (Automatic Mode)
+
+The keepalive integration uses a fly.io container with headless Chrome to automatically open the Colab notebook, run the cells, extract the tunnel URL, and keep the runtime alive.
+
+### 1. Deploy the keepalive container
+
+```bash
+# Install flyctl: https://fly.io/docs/flyctl/install/
+cd keepalive
+
+# Create the app (don't deploy yet)
+fly launch --no-deploy
+
+# Create a persistent volume for Chrome profile data
+fly volumes create chrome_data --region nrt --size 1
+
+# Generate an API key for the container
+export KEEPALIVE_API_KEY=$(openssl rand -hex 16)
+echo "KEEPALIVE_API_KEY=$KEEPALIVE_API_KEY"  # Save this!
+
+# Set the secret on fly.io
+fly secrets set API_KEY=$KEEPALIVE_API_KEY
+
+# Deploy
+fly deploy
+```
+
+### 2. Initial Google login
+
+The keepalive container needs Google login cookies to access Colab. Do this once:
+
+```bash
+# Start Chrome in setup mode with remote debugging
+curl -X POST https://colab-keepalive.fly.dev/setup \
+  -H "X-Api-Key: $KEEPALIVE_API_KEY"
+
+# Proxy the Chrome DevTools port to your local machine
+fly proxy 9222:9222
+
+# In your local Chrome browser:
+# 1. Go to chrome://inspect
+# 2. Click "Configure..." and add localhost:9222
+# 3. Wait for the remote Chrome tab to appear
+# 4. Click "inspect" on the accounts.google.com tab
+# 5. Log in to your Google account in the remote browser
+# 6. Close the inspector when done
+
+# Stop the setup browser
+curl -X POST https://colab-keepalive.fly.dev/stop \
+  -H "X-Api-Key: $KEEPALIVE_API_KEY"
+```
+
+### 3. Add secrets to CF Worker
+
+```bash
+npx wrangler secret put FLYIO_API_TOKEN      # fly.io personal access token
+npx wrangler secret put FLYIO_APP_NAME        # "colab-keepalive" (or your app name)
+npx wrangler secret put KEEPALIVE_API_KEY     # Same key generated above
+
+npm run deploy
+```
+
+### 4. Usage
+
+Once set up, use `colab_start` in Claude to automatically launch the Colab runtime:
+
+```
+Use colab_start with the notebook URL to start the runtime.
+```
+
+Claude will:
+1. Start the fly.io keepalive container
+2. Open the notebook in headless Chrome
+3. Run all cells
+4. Extract and register the tunnel URL
+5. Begin keepalive to prevent idle timeout
+
+Use `colab_stop` to manually shut down the keepalive and Colab session.
+
+Use `keepalive_screenshot` to debug — it returns a screenshot of the headless browser.
+
 ## Tools
 
 | Tool | Description |
 |------|-------------|
+| `colab_start` | Start Colab runtime via fly.io keepalive (automatic setup) |
+| `colab_stop` | Stop the keepalive session and clean up |
 | `colab_status` | Get Colab runtime status (GPU, memory) |
 | `colab_exec` | Execute a shell command |
 | `colab_python` | Execute Python code with GPU access |
 | `colab_upload` | Upload a file (base64) |
 | `colab_download` | Download a file (base64) |
-| `colab_register` | Register/update the Colab tunnel URL |
+| `colab_register` | Manually register/update the Colab tunnel URL |
+| `keepalive_screenshot` | Screenshot of the keepalive browser (debug) |
 
 ## Environment Variables (Secrets)
 
@@ -171,6 +279,9 @@ else:
 | `GITHUB_CLIENT_SECRET` | Yes | GitHub OAuth App client secret |
 | `COOKIE_ENCRYPTION_KEY` | Yes | Random string for cookie signing |
 | `ALLOWED_USERS` | No | Comma-separated GitHub usernames to restrict access |
+| `FLYIO_API_TOKEN` | For keepalive | fly.io personal access token |
+| `FLYIO_APP_NAME` | For keepalive | fly.io app name (e.g., "colab-keepalive") |
+| `KEEPALIVE_API_KEY` | For keepalive | Shared API key for keepalive container auth |
 
 ## License
 

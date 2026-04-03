@@ -13,6 +13,112 @@ type Props = {
 	accessToken: string;
 };
 
+// ── fly.io Machines API helpers ─────────────────────────────────────
+
+const FLYIO_API_BASE = "https://api.machines.dev/v1";
+
+async function flyApiCall(
+	env: Env,
+	path: string,
+	method: "GET" | "POST" = "GET",
+	body?: unknown,
+): Promise<Response> {
+	return fetch(`${FLYIO_API_BASE}${path}`, {
+		method,
+		headers: {
+			Authorization: `Bearer ${env.FLYIO_API_TOKEN}`,
+			"Content-Type": "application/json",
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+}
+
+async function getKeepaliveUrl(env: Env): Promise<string> {
+	return `https://${env.FLYIO_APP_NAME}.fly.dev`;
+}
+
+async function keepaliveApiCall(
+	env: Env,
+	path: string,
+	method: "GET" | "POST" = "GET",
+	body?: unknown,
+): Promise<Response> {
+	const baseUrl = await getKeepaliveUrl(env);
+	return fetch(`${baseUrl}${path}`, {
+		method,
+		headers: {
+			"Content-Type": "application/json",
+			"X-Api-Key": env.KEEPALIVE_API_KEY,
+		},
+		body: body ? JSON.stringify(body) : undefined,
+	});
+}
+
+async function ensureMachineStarted(env: Env): Promise<{ ok: boolean; error?: string }> {
+	const listRes = await flyApiCall(env, `/apps/${env.FLYIO_APP_NAME}/machines`);
+	if (!listRes.ok) {
+		return { ok: false, error: `Failed to list machines: ${listRes.status}` };
+	}
+
+	const machines = (await listRes.json()) as Array<{ id: string; state: string }>;
+	if (machines.length === 0) {
+		return {
+			ok: false,
+			error: "No machines found. Please deploy the keepalive container first with 'fly deploy'.",
+		};
+	}
+
+	const machine = machines[0];
+	if (machine.state !== "started") {
+		const startRes = await flyApiCall(
+			env,
+			`/apps/${env.FLYIO_APP_NAME}/machines/${machine.id}/start`,
+			"POST",
+		);
+		if (!startRes.ok && startRes.status !== 200) {
+			return { ok: false, error: `Failed to start machine: ${startRes.status}` };
+		}
+	}
+
+	return { ok: true };
+}
+
+async function waitForHealth(env: Env, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	const baseUrl = await getKeepaliveUrl(env);
+
+	while (Date.now() < deadline) {
+		try {
+			const res = await fetch(`${baseUrl}/health`, {
+				signal: AbortSignal.timeout(5000),
+			});
+			if (res.ok) return true;
+		} catch {
+			// Not ready yet
+		}
+		await new Promise((r) => setTimeout(r, 3000));
+	}
+	return false;
+}
+
+async function stopMachine(env: Env): Promise<void> {
+	const listRes = await flyApiCall(env, `/apps/${env.FLYIO_APP_NAME}/machines`);
+	if (!listRes.ok) return;
+
+	const machines = (await listRes.json()) as Array<{ id: string; state: string }>;
+	for (const machine of machines) {
+		if (machine.state === "started") {
+			await flyApiCall(
+				env,
+				`/apps/${env.FLYIO_APP_NAME}/machines/${machine.id}/stop`,
+				"POST",
+			);
+		}
+	}
+}
+
+// ── MCP Server ──────────────────────────────────────────────────────
+
 export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 	server = new McpServer({
 		name: "Colab MCP Proxy",
@@ -97,7 +203,7 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 
 		this.server.tool(
 			"colab_register",
-			"Register or update the Colab tunnel URL. Run this after starting the Colab executor.",
+			"Manually register or update the Colab tunnel URL. Normally colab_start handles this automatically. Use this only when manually setting up the tunnel.",
 			{
 				tunnel_url: z.string().url().describe("The cloudflared tunnel URL of the Colab executor"),
 			},
@@ -106,6 +212,152 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 				return {
 					content: [{ type: "text", text: `Colab tunnel URL registered: ${tunnel_url}` }],
 				};
+			},
+		);
+
+		this.server.tool(
+			"colab_start",
+			"Start a Colab runtime via the fly.io keepalive container. Opens the notebook, runs all cells, extracts the tunnel URL, and begins keepalive to prevent idle timeout.",
+			{
+				notebook_url: z.string().url().describe("Google Colab notebook URL to open"),
+			},
+			async ({ notebook_url }) => {
+				try {
+					// 1. Ensure fly.io machine is started
+					const machineResult = await ensureMachineStarted(this.env);
+					if (!machineResult.ok) {
+						return {
+							content: [{ type: "text", text: `Error: ${machineResult.error}` }],
+						};
+					}
+
+					// 2. Wait for container health
+					const healthy = await waitForHealth(this.env, 30_000);
+					if (!healthy) {
+						return {
+							content: [{
+								type: "text",
+								text: "Error: Keepalive container failed to become healthy within 30 seconds.",
+							}],
+						};
+					}
+
+					// 3. Get the worker's own URL for callback
+					const workerUrl = `https://colab-mcp-proxy.workers.dev`;
+					const callbackUrl = `${workerUrl}/internal/register-tunnel`;
+
+					// 4. Tell keepalive container to start the session
+					const startRes = await keepaliveApiCall(this.env, "/start", "POST", {
+						notebook_url,
+						callback_url: callbackUrl,
+					});
+
+					if (!startRes.ok) {
+						const errText = await startRes.text();
+						return {
+							content: [{
+								type: "text",
+								text: `Error starting keepalive session: ${startRes.status} ${errText}`,
+							}],
+						};
+					}
+
+					// 5. Poll KV for tunnel URL (max 300 seconds, 5 second interval)
+					const pollDeadline = Date.now() + 300_000;
+					while (Date.now() < pollDeadline) {
+						const tunnelUrl = await this.env.COLAB_KV.get("colab_tunnel_url");
+						if (tunnelUrl) {
+							return {
+								content: [{
+									type: "text",
+									text: `Colab runtime started successfully!\nTunnel URL: ${tunnelUrl}\nKeepalive is active — the runtime will stay connected.`,
+								}],
+							};
+						}
+						await new Promise((r) => setTimeout(r, 5000));
+					}
+
+					return {
+						content: [{
+							type: "text",
+							text: "Timed out waiting for tunnel URL (300s). The keepalive container may still be working. Use keepalive_screenshot to check the current state.",
+						}],
+					};
+				} catch (e: unknown) {
+					const message = e instanceof Error ? e.message : String(e);
+					return {
+						content: [{ type: "text", text: `Error in colab_start: ${message}` }],
+					};
+				}
+			},
+		);
+
+		this.server.tool(
+			"colab_stop",
+			"Stop the Colab keepalive session, clean up the tunnel URL, and stop the fly.io machine.",
+			{},
+			async () => {
+				try {
+					// 1. Tell keepalive container to stop
+					try {
+						await keepaliveApiCall(this.env, "/stop", "POST");
+					} catch {
+						// Container might already be stopped
+					}
+
+					// 2. Clean up KV
+					await this.env.COLAB_KV.delete("colab_tunnel_url");
+					await this.env.COLAB_KV.delete("ping_failures");
+
+					// 3. Stop the fly.io machine
+					await stopMachine(this.env);
+
+					return {
+						content: [{ type: "text", text: "Colab keepalive stopped and cleaned up." }],
+					};
+				} catch (e: unknown) {
+					const message = e instanceof Error ? e.message : String(e);
+					return {
+						content: [{ type: "text", text: `Error in colab_stop: ${message}` }],
+					};
+				}
+			},
+		);
+
+		this.server.tool(
+			"keepalive_screenshot",
+			"Take a screenshot of the keepalive container's browser for debugging.",
+			{},
+			async () => {
+				try {
+					const res = await keepaliveApiCall(this.env, "/screenshot", "POST");
+					if (!res.ok) {
+						return {
+							content: [{
+								type: "text",
+								text: `Screenshot failed: ${res.status} ${await res.text()}`,
+							}],
+						};
+					}
+
+					const arrayBuf = await res.arrayBuffer();
+					const base64 = btoa(
+						String.fromCharCode(...new Uint8Array(arrayBuf)),
+					);
+
+					return {
+						content: [{
+							type: "image",
+							data: base64,
+							mimeType: "image/png",
+						}],
+					};
+				} catch (e: unknown) {
+					const message = e instanceof Error ? e.message : String(e);
+					return {
+						content: [{ type: "text", text: `Screenshot error: ${message}` }],
+					};
+				}
 			},
 		);
 	}
@@ -119,7 +371,7 @@ export class ColabMCP extends McpAgent<Env, Record<string, never>, Props> {
 		if (!tunnelUrl) {
 			return {
 				error:
-					"No Colab runtime connected. Please start the Colab executor notebook and register the tunnel URL using colab_register.",
+					"No Colab runtime connected. Use colab_start to start a Colab session, or colab_register to manually register a tunnel URL.",
 			};
 		}
 
@@ -155,8 +407,60 @@ const oauthProvider = new OAuthProvider({
 	tokenEndpoint: "/token",
 });
 
+// ── Internal endpoint handlers ──────────────────────────────────────
+
+async function handleInternalEndpoint(
+	request: Request,
+	env: Env,
+): Promise<Response | null> {
+	const url = new URL(request.url);
+
+	// Only handle /internal/* paths
+	if (!url.pathname.startsWith("/internal/")) return null;
+
+	// Authenticate with KEEPALIVE_API_KEY
+	if (request.headers.get("X-Api-Key") !== env.KEEPALIVE_API_KEY) {
+		return new Response(JSON.stringify({ error: "Unauthorized" }), {
+			status: 401,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	if (url.pathname === "/internal/register-tunnel" && request.method === "POST") {
+		const body = (await request.json()) as { tunnel_url?: string };
+		if (body.tunnel_url) {
+			await env.COLAB_KV.put("colab_tunnel_url", body.tunnel_url);
+			return new Response(JSON.stringify({ ok: true }), {
+				headers: { "Content-Type": "application/json" },
+			});
+		}
+		return new Response(JSON.stringify({ error: "tunnel_url required" }), {
+			status: 400,
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	if (url.pathname === "/internal/deregister-tunnel" && request.method === "POST") {
+		await env.COLAB_KV.delete("colab_tunnel_url");
+		return new Response(JSON.stringify({ ok: true }), {
+			headers: { "Content-Type": "application/json" },
+		});
+	}
+
+	return new Response(JSON.stringify({ error: "Not found" }), {
+		status: 404,
+		headers: { "Content-Type": "application/json" },
+	});
+}
+
+// ── Export ───────────────────────────────────────────────────────────
+
 export default {
-	fetch(request: Request, env: Env, ctx: ExecutionContext) {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+		// Handle internal endpoints before OAuth
+		const internalResponse = await handleInternalEndpoint(request, env);
+		if (internalResponse) return internalResponse;
+
 		return oauthProvider.fetch(request, env, ctx);
 	},
 
@@ -169,11 +473,42 @@ export default {
 		if (!tunnelUrl) return;
 
 		try {
-			await fetch(`${tunnelUrl}/status`, {
+			const res = await fetch(`${tunnelUrl}/status`, {
 				signal: AbortSignal.timeout(10_000),
 			});
+
+			if (res.ok) {
+				// Reset failure counter on success
+				await env.COLAB_KV.delete("ping_failures");
+				return;
+			}
 		} catch {
-			// Colab runtime may be disconnected — silently ignore
+			// Connection failed
+		}
+
+		// Increment failure counter
+		const failuresStr = await env.COLAB_KV.get("ping_failures");
+		const failures = (failuresStr ? parseInt(failuresStr, 10) : 0) + 1;
+
+		if (failures >= 5) {
+			// 5 consecutive failures — clean up
+			console.log("Colab ping failed 5 times, cleaning up");
+			await env.COLAB_KV.delete("colab_tunnel_url");
+			await env.COLAB_KV.delete("ping_failures");
+
+			// Best-effort: stop keepalive container and machine
+			try {
+				await keepaliveApiCall(env, "/stop", "POST");
+			} catch {
+				// Ignore
+			}
+			try {
+				await stopMachine(env);
+			} catch {
+				// Ignore
+			}
+		} else {
+			await env.COLAB_KV.put("ping_failures", String(failures));
 		}
 	},
 };

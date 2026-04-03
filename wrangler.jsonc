@@ -10,6 +10,9 @@
    *   GITHUB_CLIENT_SECRET
    *   COOKIE_ENCRYPTION_KEY
    *   ALLOWED_USERS          — comma-separated GitHub usernames (optional)
+   *   FLYIO_API_TOKEN        — fly.io personal access token (Machines API)
+   *   FLYIO_APP_NAME         — fly.io app name (e.g. "colab-keepalive")
+   *   KEEPALIVE_API_KEY      — API key for the keepalive container
    */
   "migrations": [
     {
