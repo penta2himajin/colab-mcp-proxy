@@ -1,0 +1,9 @@
+{
+  "name": "colab-keepalive",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}
