@@ -35,7 +35,7 @@ export async function launchBrowser(url, opts = {}) {
 
   browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
-    headless: opts.setup ? false : true,
+    headless: true,
     args,
   });
 
