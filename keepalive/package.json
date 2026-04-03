@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "type": "module",
   "private": true,
+  "scripts": {
+    "setup": "node setup.mjs"
+  },
   "dependencies": {
     "puppeteer-core": "^24.0.0"
   }
