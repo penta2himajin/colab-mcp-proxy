@@ -1,11 +1,9 @@
 import puppeteer from "puppeteer-core";
-import { execSync, spawn as cpSpawn } from "node:child_process";
 
 const CHROME_PROFILE_DIR = process.env.CHROME_PROFILE_DIR || "/data/chrome-profile";
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 const KEEPALIVE_INTERVAL_MS = 60_000;
 const TUNNEL_URL_REGEX = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
-let xvfbProcess = null;
 
 let browser = null;
 let page = null;
@@ -22,7 +20,7 @@ export function getState() {
   };
 }
 
-export async function launchBrowser(url, opts = {}) {
+export async function launchBrowser(url) {
   const args = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -35,43 +33,19 @@ export async function launchBrowser(url, opts = {}) {
     `--user-data-dir=${CHROME_PROFILE_DIR}`,
   ];
 
-  let headless = true;
-
-  if (opts.setup) {
-    // Start Xvfb for non-headless Chrome (bypasses Google's headless detection)
-    if (!xvfbProcess) {
-      xvfbProcess = cpSpawn("Xvfb", [":99", "-screen", "0", "1280x800x24", "-nolisten", "tcp"], {
-        stdio: "ignore",
-      });
-      process.env.DISPLAY = ":99";
-      // Wait for Xvfb to be ready
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-    headless = false;
-  }
-
-  if (!headless) {
-    // Non-headless needs explicit debugging port for Puppeteer to connect
-    args.push("--remote-debugging-port=9222");
-  }
-
   browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
-    headless,
+    headless: true,
     args,
     protocolTimeout: 120_000,
-    pipe: headless,
     timeout: 60_000,
   });
 
   page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
 
-  if (url && !opts.setup) {
+  if (url) {
     await page.goto(url, { waitUntil: "networkidle2", timeout: 60_000 });
-  } else if (url) {
-    // In setup mode, navigate without waiting for networkidle
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
   return page;
@@ -295,10 +269,6 @@ export async function closeBrowser() {
     browser = null;
     page = null;
   }
-  if (xvfbProcess) {
-    xvfbProcess.kill();
-    xvfbProcess = null;
-  }
   state = "idle";
 }
 
@@ -307,31 +277,6 @@ export async function takeScreenshot() {
     throw new Error("No active page");
   }
   return await page.screenshot({ type: "png" });
-}
-
-export async function navigateTo(url) {
-  if (!page || page.isClosed()) throw new Error("No active page");
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-}
-
-export async function typeText(text) {
-  if (!page || page.isClosed()) throw new Error("No active page");
-  await page.keyboard.type(text, { delay: 50 });
-}
-
-export async function pressKey(key) {
-  if (!page || page.isClosed()) throw new Error("No active page");
-  await page.keyboard.press(key);
-}
-
-export async function clickAt(x, y) {
-  if (!page || page.isClosed()) throw new Error("No active page");
-  await page.mouse.click(x, y);
-}
-
-export async function clickSelector(selector) {
-  if (!page || page.isClosed()) throw new Error("No active page");
-  await page.click(selector);
 }
 
 function sleep(ms) {
