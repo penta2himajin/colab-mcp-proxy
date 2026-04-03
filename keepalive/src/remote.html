@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colab Keepalive — Remote Browser</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    color: #eee;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+  }
+  header {
+    padding: 12px 20px;
+    width: 100%;
+    max-width: 1320px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 16px; font-weight: 500; }
+  #status {
+    font-size: 13px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    background: #333;
+  }
+  #status.connected { background: #1b5e20; }
+  #status.error { background: #b71c1c; }
+  #container {
+    position: relative;
+    cursor: crosshair;
+    border: 1px solid #333;
+    border-radius: 4px;
+    overflow: hidden;
+    background: #000;
+  }
+  #screen {
+    display: block;
+    max-width: 100%;
+    image-rendering: auto;
+  }
+  #url-bar {
+    width: 100%;
+    max-width: 1320px;
+    padding: 8px 20px;
+    display: flex;
+    gap: 8px;
+  }
+  #url-input {
+    flex: 1;
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid #444;
+    background: #2a2a3e;
+    color: #eee;
+    font-size: 14px;
+    outline: none;
+  }
+  #url-input:focus { border-color: #6c63ff; }
+  .btn {
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: none;
+    background: #6c63ff;
+    color: #fff;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .btn:hover { background: #5a52d5; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  #keyboard-input {
+    position: absolute;
+    left: -9999px;
+    opacity: 0;
+  }
+  #hint {
+    color: #888;
+    font-size: 12px;
+    padding: 8px;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Colab Keepalive — Remote Browser</h1>
+    <span id="status">Connecting...</span>
+  </header>
+  <div id="url-bar">
+    <input id="url-input" type="text" placeholder="Navigate to URL..." value="https://accounts.google.com" />
+    <button class="btn" onclick="navigate()">Go</button>
+  </div>
+  <div id="container" tabindex="0">
+    <canvas id="screen" width="1280" height="800"></canvas>
+    <input id="keyboard-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" />
+  </div>
+  <div id="hint">Click the screen to focus. Type normally. Click to interact.</div>
+
+<script>
+const API_KEY = new URLSearchParams(location.search).get("key") || "";
+const BASE = location.origin;
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const container = document.getElementById("container");
+const kbInput = document.getElementById("keyboard-input");
+const statusEl = document.getElementById("status");
+
+let polling = true;
+let busy = false;
+let imgWidth = 1280;
+let imgHeight = 800;
+
+function headers() {
+  return {
+    "X-Api-Key": API_KEY,
+    "Content-Type": "application/json",
+  };
+}
+
+async function api(path, method = "GET", body = null) {
+  const opts = { method, headers: headers() };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(BASE + path, opts);
+  return res;
+}
+
+// Screenshot polling
+async function pollScreenshot() {
+  if (!polling || busy) return;
+  busy = true;
+  try {
+    const res = await api("/screenshot", "POST");
+    if (res.ok) {
+      const blob = await res.blob();
+      const img = await createImageBitmap(blob);
+      imgWidth = img.width;
+      imgHeight = img.height;
+      canvas.width = imgWidth;
+      canvas.height = imgHeight;
+      ctx.drawImage(img, 0, 0);
+      statusEl.textContent = "Connected";
+      statusEl.className = "connected";
+    } else {
+      statusEl.textContent = "No browser";
+      statusEl.className = "error";
+    }
+  } catch (e) {
+    statusEl.textContent = "Error";
+    statusEl.className = "error";
+  }
+  busy = false;
+}
+
+setInterval(pollScreenshot, 800);
+pollScreenshot();
+
+// Map canvas click coordinates to actual browser coordinates
+function getCoords(e) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = imgWidth / rect.width;
+  const scaleY = imgHeight / rect.height;
+  return {
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY),
+  };
+}
+
+// Click handling
+container.addEventListener("click", async (e) => {
+  e.preventDefault();
+  kbInput.focus();
+  const { x, y } = getCoords(e);
+  await api("/click", "POST", { x, y });
+  setTimeout(pollScreenshot, 300);
+});
+
+// Keyboard handling — capture all keys
+container.addEventListener("focus", () => kbInput.focus());
+canvas.addEventListener("focus", () => kbInput.focus());
+
+const SPECIAL_KEYS = new Set([
+  "Enter", "Backspace", "Tab", "Escape",
+  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  "Delete", "Home", "End", "PageUp", "PageDown",
+  "F1", "F2", "F3", "F4", "F5", "F6",
+  "F7", "F8", "F9", "F10", "F11", "F12",
+]);
+
+document.addEventListener("keydown", async (e) => {
+  if (e.target === document.getElementById("url-input")) return;
+
+  if (SPECIAL_KEYS.has(e.key)) {
+    e.preventDefault();
+    await api("/type", "POST", { key: e.key });
+    setTimeout(pollScreenshot, 300);
+  }
+  // Regular characters fall through to the hidden input's input event
+});
+
+// For regular character input
+kbInput.addEventListener("input", async () => {
+  const text = kbInput.value;
+  if (text) {
+    kbInput.value = "";
+    await api("/type", "POST", { text });
+    setTimeout(pollScreenshot, 300);
+  }
+});
+
+// URL navigation
+async function navigate() {
+  const url = document.getElementById("url-input").value.trim();
+  if (!url) return;
+  statusEl.textContent = "Navigating...";
+  statusEl.className = "";
+  await api("/navigate", "POST", { url });
+  setTimeout(pollScreenshot, 1000);
+}
+
+document.getElementById("url-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    navigate();
+  }
+});
+</script>
+</body>
+</html>
