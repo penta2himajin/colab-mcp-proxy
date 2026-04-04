@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { get } from "node:http";
 
 const CHROME_PROFILE_DIR = process.env.CHROME_PROFILE_DIR || "/data/chrome-profile";
 const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
@@ -29,39 +30,126 @@ async function cdpGet(path) {
 }
 
 async function cdpConnect(targetId) {
-  const wsUrl = `ws://127.0.0.1:9222/devtools/page/${targetId}`;
-  const ws = new WebSocket(wsUrl);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
+  const path = `/devtools/page/${targetId}`;
+  const { createConnection } = await import("node:net");
+  const crypto = await import("node:crypto");
 
-  let msgId = 0;
-  const pending = new Map();
-
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.id && pending.has(data.id)) {
-      pending.get(data.id)(data);
-      pending.delete(data.id);
-    }
-  };
-
-  function send(method, params = {}) {
-    return new Promise((resolve, reject) => {
-      const id = ++msgId;
-      pending.set(id, resolve);
-      ws.send(JSON.stringify({ id, method, params }));
-      setTimeout(() => {
-        if (pending.has(id)) {
-          pending.delete(id);
-          reject(new Error(`CDP timeout: ${method}`));
-        }
-      }, 30000);
+  return new Promise((resolve, reject) => {
+    const key = crypto.randomBytes(16).toString("base64");
+    const socket = createConnection(9222, "127.0.0.1", () => {
+      socket.write(
+        `GET ${path} HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:9222\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${key}\r\n` +
+        `Sec-WebSocket-Version: 13\r\n` +
+        `\r\n`
+      );
     });
-  }
 
-  return { ws, send };
+    let msgId = 0;
+    const pending = new Map();
+    let upgraded = false;
+    let buffer = Buffer.alloc(0);
+
+    function processFrame(buf) {
+      // Minimal WebSocket frame parser (text frames only, no masking from server)
+      if (buf.length < 2) return { frame: null, rest: buf };
+      const secondByte = buf[1] & 0x7f;
+      let payloadLen = secondByte;
+      let offset = 2;
+      if (secondByte === 126) {
+        if (buf.length < 4) return { frame: null, rest: buf };
+        payloadLen = buf.readUInt16BE(2);
+        offset = 4;
+      } else if (secondByte === 127) {
+        if (buf.length < 10) return { frame: null, rest: buf };
+        payloadLen = Number(buf.readBigUInt64BE(2));
+        offset = 10;
+      }
+      if (buf.length < offset + payloadLen) return { frame: null, rest: buf };
+      const payload = buf.slice(offset, offset + payloadLen).toString("utf-8");
+      return { frame: payload, rest: buf.slice(offset + payloadLen) };
+    }
+
+    function sendWs(data) {
+      const payload = Buffer.from(JSON.stringify(data));
+      const header = [];
+      header.push(0x81); // text frame, fin
+      const mask = crypto.randomBytes(4);
+      if (payload.length < 126) {
+        header.push(0x80 | payload.length);
+      } else if (payload.length < 65536) {
+        header.push(0x80 | 126);
+        header.push((payload.length >> 8) & 0xff);
+        header.push(payload.length & 0xff);
+      } else {
+        header.push(0x80 | 127);
+        const lenBuf = Buffer.alloc(8);
+        lenBuf.writeBigUInt64BE(BigInt(payload.length));
+        header.push(...lenBuf);
+      }
+      header.push(...mask);
+      const masked = Buffer.alloc(payload.length);
+      for (let i = 0; i < payload.length; i++) {
+        masked[i] = payload[i] ^ mask[i % 4];
+      }
+      socket.write(Buffer.concat([Buffer.from(header), masked]));
+    }
+
+    function send(method, params = {}) {
+      return new Promise((resolve, rej) => {
+        const id = ++msgId;
+        pending.set(id, resolve);
+        sendWs({ id, method, params });
+        setTimeout(() => {
+          if (pending.has(id)) {
+            pending.delete(id);
+            rej(new Error(`CDP timeout: ${method}`));
+          }
+        }, 30000);
+      });
+    }
+
+    socket.on("data", (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      if (!upgraded) {
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+        // Check for 101 Switching Protocols
+        const header = buffer.slice(0, headerEnd).toString();
+        if (!header.includes("101")) {
+          reject(new Error("WebSocket upgrade failed"));
+          socket.destroy();
+          return;
+        }
+        upgraded = true;
+        buffer = buffer.slice(headerEnd + 4);
+        resolve({
+          ws: { close: () => socket.destroy() },
+          send,
+        });
+      }
+
+      // Process WebSocket frames
+      while (buffer.length > 0) {
+        const { frame, rest } = processFrame(buffer);
+        if (!frame) break;
+        buffer = rest;
+        try {
+          const data = JSON.parse(frame);
+          if (data.id && pending.has(data.id)) {
+            pending.get(data.id)(data);
+            pending.delete(data.id);
+          }
+        } catch { /* ignore non-JSON or events */ }
+      }
+    });
+
+    socket.on("error", reject);
+  });
 }
 
 // ── Browser management ─────────────────────────────────────────────
@@ -85,6 +173,8 @@ export async function launchBrowser(url) {
     "--disable-gpu",
     "--disable-software-rasterizer",
     "--disable-dbus",
+    "--disable-popup-blocking",
+    "--disable-blink-features=AutomationControlled",
     "--remote-debugging-port=9222",
     "--remote-debugging-address=127.0.0.1",
     "--window-size=1280,800",
@@ -133,7 +223,7 @@ export async function startColabSession(notebookUrl, cbUrl) {
     await send("Page.enable");
 
     // Wait for runtime to connect (max 120s)
-    const connected = await waitForRuntimeConnection(send, 120_000);
+    const connected = await waitForRuntimeConnection(send, 300_000);
     if (!connected) {
       ws.close();
       throw new Error("Timed out waiting for Colab runtime connection");
@@ -188,6 +278,21 @@ async function waitForRuntimeConnection(send, timeoutMs) {
       });
 
       const status = result?.result?.result?.value;
+
+      // Log page state and errors periodically
+      if (Date.now() % 20000 < 2100) {
+        const urlCheck = await send("Runtime.evaluate", {
+          expression: `JSON.stringify({
+            url: location.href.slice(0, 100),
+            title: document.title,
+            errorEls: [...document.querySelectorAll('[class*="error"], [role="alert"]')].map(e => e.textContent?.trim()?.slice(0, 200)),
+            dialogEls: [...document.querySelectorAll('dialog, [role="dialog"], md-dialog, mwc-dialog')].map(e => e.textContent?.trim()?.slice(0, 200)),
+          })`,
+          returnByValue: true,
+        }).catch(() => null);
+        console.log(`[keepalive] Page state: ${urlCheck?.result?.result?.value || "unknown"}`);
+      }
+
       console.log(`[keepalive] Runtime check: ${JSON.stringify(status)}`);
 
       if (status && /connected/i.test(status) && !/reconnect/i.test(status)) {
@@ -212,8 +317,15 @@ async function waitForRuntimeConnection(send, timeoutMs) {
         }
       }
 
-      // "Connect\n           T4" or similar — click to start runtime
-      if (status && /connect/i.test(status) && !/connected/i.test(status)) {
+      // "Connecting" — runtime is being allocated, just wait
+      if (status && /connecting/i.test(status)) {
+        // Do nothing, wait for allocation
+        await sleep(2000);
+        continue;
+      }
+
+      // "Connect\n           T4" or "Reconnect\n           T4" — click to start runtime
+      if (status && /connect/i.test(status) && !/connecting|connected/i.test(status)) {
         await send("Runtime.evaluate", {
           expression: `(() => {
             const btn = document.querySelector("colab-connect-button");
@@ -257,16 +369,77 @@ async function waitForTunnelUrl(send, timeoutMs) {
 
   while (Date.now() < deadline) {
     try {
-      const result = await send("Runtime.evaluate", {
+      // Check for OAuth popup tab and auto-approve
+      try {
+        const targets = await cdpGet("/json");
+        const oauthPage = targets.find((t) =>
+          t.type === "page" && t.url &&
+          (t.url.includes("accounts.google.com/o/oauth2") ||
+           t.url.includes("accounts.google.com/signin/oauth"))
+        );
+        if (oauthPage) {
+          console.log(`[keepalive] Found OAuth popup: ${oauthPage.url}`);
+          const { ws: oauthWs, send: oauthSend } = await cdpConnect(oauthPage.id);
+          await oauthSend("Runtime.enable");
+          // Wait for page to load
+          await sleep(3000);
+          // Click "Allow" / "許可" button
+          const clickResult = await oauthSend("Runtime.evaluate", {
+            expression: `(() => {
+              const btns = document.querySelectorAll('button, [role="button"]');
+              for (const btn of btns) {
+                const text = btn.textContent?.trim();
+                if (/Allow|許可|Continue|続行|次へ|Next|Sign in/i.test(text)) {
+                  btn.click();
+                  return 'clicked:' + text;
+                }
+              }
+              // Also try submit buttons
+              const submit = document.querySelector('input[type="submit"], button[type="submit"]');
+              if (submit) { submit.click(); return 'clicked:submit'; }
+              return null;
+            })()`,
+            returnByValue: true,
+          });
+          const cv = clickResult?.result?.result?.value;
+          if (cv) console.log(`[keepalive] OAuth popup: ${cv}`);
+          oauthWs.close();
+        }
+      } catch (err) {
+        // OAuth popup handling is best-effort
+      }
+
+      // Dismiss Drive permission dialog if present (md-text-button with dialogaction="ok")
+      await send("Runtime.evaluate", {
         expression: `(() => {
-          const outputs = document.querySelectorAll(
-            ".output_text, .output_stream, .cell-output-text, [class*='output']"
-          );
-          for (const el of outputs) {
-            const match = el.textContent.match(/https:\\/\\/[a-z0-9-]+\\.trycloudflare\\.com/);
-            if (match) return match[0];
+          // Colab uses <md-text-button dialogaction="ok"> for Drive permission
+          const mdBtns = document.querySelectorAll('md-text-button[dialogaction="ok"]');
+          for (const btn of mdBtns) {
+            btn.click();
+            return 'clicked:md-text-button:' + btn.textContent?.trim();
+          }
+          // Fallback: any button with Drive/Connect/Allow text
+          const allBtns = document.querySelectorAll('button, [role="button"], mwc-button, md-text-button, md-filled-button');
+          for (const btn of allBtns) {
+            const text = btn.textContent?.trim();
+            if (/Connect to Google Drive|接続|許可|Allow/i.test(text)) {
+              btn.click();
+              return 'clicked:' + text;
+            }
           }
           return null;
+        })()`,
+        returnByValue: true,
+      }).then(r => {
+        const v = r?.result?.result?.value;
+        if (v) console.log(`[keepalive] Dismissed dialog: ${v}`);
+      }).catch(() => {});
+
+      const result = await send("Runtime.evaluate", {
+        expression: `(() => {
+          const bodyText = document.body?.innerText || "";
+          const match = bodyText.match(/https:\\/\\/[a-z0-9-]+\\.trycloudflare\\.com/);
+          return match ? match[0] : null;
         })()`,
         returnByValue: true,
       });
@@ -374,10 +547,13 @@ export async function takeScreenshot() {
   if (!pageTarget) throw new Error("No page target");
 
   const { ws, send } = await cdpConnect(pageTarget.id);
-  const result = await send("Page.captureScreenshot", { format: "png" });
-  ws.close();
-
-  return Buffer.from(result?.result?.data, "base64");
+  try {
+    await send("Page.enable");
+    const result = await send("Page.captureScreenshot", { format: "png" });
+    return Buffer.from(result.result.data, "base64");
+  } finally {
+    ws.close();
+  }
 }
 
 function sleep(ms) {
